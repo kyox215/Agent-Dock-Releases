@@ -1,0 +1,56 @@
+name: Verify Windows 0.28.4 installer
+on:
+  push:
+    branches: ['qa/0.28.4-windows-installer-once']
+permissions: {}
+jobs:
+  install:
+    if: github.repository == 'kyox215/Agent-Dock-Releases' && (github.event.created == true || github.event.head_commit.message == 'Verify default installation path and collect installer receipts')
+    runs-on: windows-2022
+    timeout-minutes: 12
+    steps:
+      - name: Verify public x64 installer and launch Agent Dock
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_ARCH -ne 'X64') { throw 'Expected native x64' }
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Host "$($os.Caption) build $($os.BuildNumber) ($env:RUNNER_ARCH)"
+          $file = Join-Path $env:RUNNER_TEMP 'agent-dock-0284.exe'
+          $root = Join-Path $env:LOCALAPPDATA 'Programs\agent-dock'
+          if (Test-Path $root) { throw 'Expected a clean runner' }
+          Invoke-WebRequest 'https://github.com/kyox215/Agent-Dock-Releases/releases/download/v0.28.4/Agent-Dock-0.28.4-Windows-x64-Setup.exe' -OutFile $file
+          if ((Get-Item $file).Length -ne 118542562 -or (Get-FileHash $file).Hash -ne '5f27a88d4e468665b1b41c18942193b70e4276f3c2fe27898ac69d0be285cac3') { throw 'Installer digest mismatch' }
+          $setup = Start-Process $file -ArgumentList '/S' -PassThru
+          if (!$setup.WaitForExit(180000)) { throw 'Installer timed out' }
+          $setup.Refresh()
+          $diagnostic = Join-Path $env:LOCALAPPDATA 'Agent Dock\installer-logs'
+          if (Test-Path $diagnostic) {
+            Get-ChildItem $diagnostic -Filter '*.json' | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json | Select-Object status,stage,reason,version | ConvertTo-Json -Compress | Write-Host }
+          }
+          Write-Host "Installer code $($setup.ExitCode)"
+          if ($setup.ExitCode -ne 0) { throw 'Installer returned a failure; see receipts' }
+          $version = (Get-Content (Join-Path $root 'current.version') -Raw).Trim()
+          if ($version -ne '0.28.4') { throw 'Wrong installed version' }
+          $bin = Join-Path $root 'versions\0.28.4\Agent Dock.exe'
+          if (!(Test-Path $bin)) { throw 'No installed application' }
+          $launcher = Join-Path $root 'Agent Dock.exe'
+          $owned = { Get-Process -Name 'Agent Dock' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $bin -and $_.MainWindowHandle -ne 0 } }
+          if (!(& $owned)) { Start-Process $launcher }
+          $until = [DateTime]::UtcNow.AddSeconds(100)
+          do { $app = & $owned; if ($app) { break }; Start-Sleep -Milliseconds 500 } while ([DateTime]::UtcNow -lt $until)
+          if (!$app) { throw 'Installed Electron window not observed' }
+          $pageDeadline = [DateTime]::UtcNow.AddSeconds(30)
+          do {
+          $port = @(Get-NetTCPConnection -State Listen | Where-Object { $_.OwningProcess -in $app.Id -and $_.LocalAddress -eq '127.0.0.1' })
+          $ready = $false
+          foreach ($p in $port) {
+            try {
+              $r = Invoke-WebRequest ("http://127.0.0.1:" + $p.LocalPort + "/") -TimeoutSec 5
+              if ($r.StatusCode -eq 200 -and $r.Content -match 'Agent Dock' -and $r.Content -match 'type="module"') { $ready = $true; break }
+            } catch {}
+          }
+          if ($ready) { break }; Start-Sleep -Seconds 1
+          } while ([DateTime]::UtcNow -lt $pageDeadline)
+          if (!$ready) { throw 'Launcher page did not respond on the installed process' }
+          Write-Host 'Verified SHA-256, native x64 installation, current.version, Electron window and launcher HTML. No account or model task was used.'
