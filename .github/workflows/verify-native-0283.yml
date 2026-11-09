@@ -5,7 +5,7 @@ on:
 permissions: {}
 jobs:
   install:
-    if: github.repository == 'kyox215/Agent-Dock-Releases' && github.event.created == true
+    if: github.repository == 'kyox215/Agent-Dock-Releases' && (github.event.created == true || github.event.head_commit.message == 'Verify default installation path and collect installer receipts')
     runs-on: windows-2022
     timeout-minutes: 12
     steps:
@@ -17,12 +17,19 @@ jobs:
           $os = Get-CimInstance Win32_OperatingSystem
           Write-Host "$($os.Caption) build $($os.BuildNumber) ($env:RUNNER_ARCH)"
           $file = Join-Path $env:RUNNER_TEMP 'agent-dock-0283.exe'
-          $root = Join-Path $env:RUNNER_TEMP 'agent-dock-0283-install'
+          $root = Join-Path $env:LOCALAPPDATA 'Programs\agent-dock'
           if (Test-Path $root) { throw 'Expected a clean runner' }
           Invoke-WebRequest 'https://github.com/kyox215/Agent-Dock-Releases/releases/download/v0.28.3/Agent-Dock-0.28.3-Windows-x64-Setup.exe' -OutFile $file
           if ((Get-Item $file).Length -ne 118542296 -or (Get-FileHash $file).Hash -ne 'e6ca614d8cf9b47012e144240259949415c943994a97445e68e3e4bc1075c308') { throw 'Installer digest mismatch' }
-          $setup = Start-Process $file -ArgumentList ("/S /D=" + $root) -PassThru
-          if (!$setup.WaitForExit(180000) -or $setup.ExitCode -ne 0) { throw 'Installer did not finish successfully' }
+          $setup = Start-Process $file -ArgumentList '/S' -PassThru
+          if (!$setup.WaitForExit(180000)) { throw 'Installer timed out' }
+          $setup.Refresh()
+          $diagnostic = Join-Path $env:LOCALAPPDATA 'Agent Dock\installer-logs'
+          if (Test-Path $diagnostic) {
+            Get-ChildItem $diagnostic -Filter '*.json' | ForEach-Object { Get-Content $_.FullName -Raw | ConvertFrom-Json | Select-Object status,stage,reason,version | ConvertTo-Json -Compress | Write-Host }
+          }
+          Write-Host "Installer code $($setup.ExitCode)"
+          if ($setup.ExitCode -ne 0) { throw 'Installer returned a failure; see receipts' }
           $version = (Get-Content (Join-Path $root 'current.version') -Raw).Trim()
           if ($version -ne '0.28.3') { throw 'Wrong installed version' }
           $bin = Join-Path $root 'versions\0.28.3\Agent Dock.exe'
